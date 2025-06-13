@@ -5,16 +5,41 @@
 
 #include "Undocumented.h"
 
+// device and IOCTL definitions
+#define DEVICE_NAME      L"\\Device\\StartSuspended"
+#define SYMLINK_NAME     L"\\??\\StartSuspended"
+#define IOCTL_STARTSUSPENDED_RESUME CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// global process pointer protected by a fast mutex
+static PEPROCESS g_SuspendedProcess = nullptr;
+FAST_MUTEX g_ProcessLock;
+
 WCHAR pSzTargetProcess[1024];
 
 VOID cbProcessCreated(PEPROCESS PEProcess, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateNotifyInfo);
 
+NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+
 PCREATE_PROCESS_NOTIFY_ROUTINE_EX pProcessNotifyRoutine = cbProcessCreated;
 
 VOID Unload(PDRIVER_OBJECT DriverObject) {
-	UNREFERENCED_PARAMETER(DriverObject);
-	KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Unloading driver\n"));
-	PsSetCreateProcessNotifyRoutineEx(pProcessNotifyRoutine, TRUE);
+        UNREFERENCED_PARAMETER(DriverObject);
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Unloading driver\n"));
+        PsSetCreateProcessNotifyRoutineEx(pProcessNotifyRoutine, TRUE);
+
+        ExAcquireFastMutex(&g_ProcessLock);
+        if (g_SuspendedProcess) {
+                PsResumeProcess(g_SuspendedProcess);
+                ObDereferenceObject(g_SuspendedProcess);
+                g_SuspendedProcess = nullptr;
+        }
+        ExReleaseFastMutex(&g_ProcessLock);
+
+        UNICODE_STRING symLink = RTL_CONSTANT_STRING(SYMLINK_NAME);
+        IoDeleteSymbolicLink(&symLink);
+        if (DriverObject->DeviceObject)
+                IoDeleteDevice(DriverObject->DeviceObject);
 }
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
@@ -27,8 +52,29 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	PKEY_VALUE_PARTIAL_INFORMATION pValuePartialInfo;
 	ULONG uLenValue;
 
-	DriverObject->DriverUnload = Unload;
-	KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Initializing kernel driver!\n"));
+        DriverObject->DriverUnload = Unload;
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Initializing kernel driver!\n"));
+
+        ExInitializeFastMutex(&g_ProcessLock);
+
+        UNICODE_STRING deviceName = RTL_CONSTANT_STRING(DEVICE_NAME);
+        PDEVICE_OBJECT deviceObject = nullptr;
+        status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &deviceObject);
+        if (!NT_SUCCESS(status)) {
+                KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to create device %08X\n", status));
+                return status;
+        }
+        UNICODE_STRING symLink = RTL_CONSTANT_STRING(SYMLINK_NAME);
+        status = IoCreateSymbolicLink(&symLink, &deviceName);
+        if (!NT_SUCCESS(status)) {
+                IoDeleteDevice(deviceObject);
+                KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to create symbolic link %08X\n", status));
+                return status;
+        }
+
+        DriverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreateClose;
+        DriverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchCreateClose;
+        DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
 
 	InitializeObjectAttributes(&objAttrs, RegistryPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 	status = ZwOpenKey(&hKey, KEY_READ, &objAttrs);
@@ -81,10 +127,48 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 }
 
 VOID cbProcessCreated(PEPROCESS PEProcess, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateNotifyInfo) {
-	UNREFERENCED_PARAMETER(PEProcess);
-	UNREFERENCED_PARAMETER(ProcessId);
-	if (CreateNotifyInfo != NULL && wcsstr(CreateNotifyInfo->CommandLine->Buffer, pSzTargetProcess) != NULL) {
-		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Suspending %S\n", pSzTargetProcess));
-		PsSuspendProcess(PEProcess);
-	}
+        UNREFERENCED_PARAMETER(ProcessId);
+        if (CreateNotifyInfo != NULL && wcsstr(CreateNotifyInfo->CommandLine->Buffer, pSzTargetProcess) != NULL) {
+                KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Suspending %S\n", pSzTargetProcess));
+                PsSuspendProcess(PEProcess);
+
+                ExAcquireFastMutex(&g_ProcessLock);
+                if (!g_SuspendedProcess) {
+                        ObReferenceObject(PEProcess);
+                        g_SuspendedProcess = PEProcess;
+                }
+                ExReleaseFastMutex(&g_ProcessLock);
+        }
+}
+
+NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+        UNREFERENCED_PARAMETER(DeviceObject);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_SUCCESS;
+}
+
+NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+        UNREFERENCED_PARAMETER(DeviceObject);
+        PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+        NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
+
+        if (stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_STARTSUSPENDED_RESUME) {
+                ExAcquireFastMutex(&g_ProcessLock);
+                if (g_SuspendedProcess) {
+                        PsResumeProcess(g_SuspendedProcess);
+                        ObDereferenceObject(g_SuspendedProcess);
+                        g_SuspendedProcess = nullptr;
+                        status = STATUS_SUCCESS;
+                } else {
+                        status = STATUS_NOT_FOUND;
+                }
+                ExReleaseFastMutex(&g_ProcessLock);
+        }
+
+        Irp->IoStatus.Status = status;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
 }

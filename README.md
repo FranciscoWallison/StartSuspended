@@ -32,6 +32,19 @@ sc stop [serviceName]
 The driver runs with SERVICE_DEMAND_START, which means you always need to start the driver manually.
 ### Continuing the suspended process
 It is possible to continue the suspended process by using the Windows resource monitor.
+
+### Using the ResumeProcess CLI
+A small command line tool is provided to send the resume request to the driver. Build it from a Developer Command Prompt with:
+
+```shell
+cl /EHsc ResumeProcess.cpp
+```
+
+Copy the resulting `ResumeProcess.exe` to the machine running the driver and execute it with administrative privileges to resume the suspended process:
+
+```shell
+ResumeProcess.exe
+```
 ### Debugging possible errors on driver start
 The driver logs every error using the [KdPrintEx](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-kdprintex) macro. The log messages can be viewed using [DebugView](https://learn.microsoft.com/en-us/sysinternals/downloads/debugview) with kernel capture on and verbose output enabled.
 ## How it works
