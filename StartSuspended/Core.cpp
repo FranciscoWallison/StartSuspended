@@ -62,14 +62,19 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 		ZwClose(hKey);
 		return STATUS_INVALID_PARAMETER;
 	}
-	RtlStringCchCopyNW(pSzTargetProcess, pValuePartialInfo->DataLength / sizeof(WCHAR), reinterpret_cast<PWSTR>(pValuePartialInfo->Data), 1024);
-	if (!wcslen(pSzTargetProcess)) {
-		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Target is invalid\n"));
-		ExFreePoolWithTag(pValuePartialInfo, 'kvpi');
-		ZwClose(hKey);
-		return STATUS_INVALID_PARAMETER;
-	}
-	ExFreePoolWithTag(pValuePartialInfo, 'kvpi');
+        status = RtlStringCchCopyNW(
+                pSzTargetProcess,
+                ARRAYSIZE(pSzTargetProcess),
+                reinterpret_cast<PWSTR>(pValuePartialInfo->Data),
+                pValuePartialInfo->DataLength / sizeof(WCHAR));
+        pSzTargetProcess[ARRAYSIZE(pSzTargetProcess) - 1] = L'\0';
+        if (!NT_SUCCESS(status) || !wcslen(pSzTargetProcess)) {
+                KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Target is invalid\n"));
+                ExFreePoolWithTag(pValuePartialInfo, 'kvpi');
+                ZwClose(hKey);
+                return NT_SUCCESS(status) ? STATUS_INVALID_PARAMETER : status;
+        }
+        ExFreePoolWithTag(pValuePartialInfo, 'kvpi');
 	ZwClose(hKey);
 	status = PsSetCreateProcessNotifyRoutineEx(pProcessNotifyRoutine, FALSE);
 	if (!NT_SUCCESS(status)) {
