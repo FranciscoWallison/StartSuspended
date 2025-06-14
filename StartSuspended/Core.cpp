@@ -42,103 +42,133 @@ VOID Unload(PDRIVER_OBJECT DriverObject) {
                 IoDeleteDevice(DriverObject->DeviceObject);
 }
 
+// Função DriverEntry Corrigida
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 	UNREFERENCED_PARAMETER(RegistryPath);
 	NTSTATUS status;
-	HANDLE hKey;
+	HANDLE hKey = NULL;
+	PDEVICE_OBJECT deviceObject = nullptr;
+	UNICODE_STRING symLink = RTL_CONSTANT_STRING(SYMLINK_NAME);
+	PKEY_VALUE_PARTIAL_INFORMATION pValuePartialInfo = NULL;
+
+	DriverObject->DriverUnload = Unload;
+	KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Initializing kernel driver!\n"));
+
+	ExInitializeFastMutex(&g_ProcessLock);
+
+	UNICODE_STRING deviceName = RTL_CONSTANT_STRING(DEVICE_NAME);
+	status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &deviceObject);
+	if (!NT_SUCCESS(status)) {
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to create device %08X\n", status));
+		goto OnError;
+	}
+
+	status = IoCreateSymbolicLink(&symLink, &deviceName);
+	if (!NT_SUCCESS(status)) {
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to create symbolic link %08X\n", status));
+		goto OnError;
+	}
+
+	DriverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreateClose;
+	DriverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchCreateClose;
+	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
+
 	OBJECT_ATTRIBUTES objAttrs;
-	UNICODE_STRING szValueName;
-	ULONG uSize = 0;
-	PKEY_VALUE_PARTIAL_INFORMATION pValuePartialInfo;
-	ULONG uLenValue;
-
-        DriverObject->DriverUnload = Unload;
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Initializing kernel driver!\n"));
-
-        ExInitializeFastMutex(&g_ProcessLock);
-
-        UNICODE_STRING deviceName = RTL_CONSTANT_STRING(DEVICE_NAME);
-        PDEVICE_OBJECT deviceObject = nullptr;
-        status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &deviceObject);
-        if (!NT_SUCCESS(status)) {
-                KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to create device %08X\n", status));
-                return status;
-        }
-        UNICODE_STRING symLink = RTL_CONSTANT_STRING(SYMLINK_NAME);
-        status = IoCreateSymbolicLink(&symLink, &deviceName);
-        if (!NT_SUCCESS(status)) {
-                IoDeleteDevice(deviceObject);
-                KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to create symbolic link %08X\n", status));
-                return status;
-        }
-
-        DriverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreateClose;
-        DriverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchCreateClose;
-        DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
-
 	InitializeObjectAttributes(&objAttrs, RegistryPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 	status = ZwOpenKey(&hKey, KEY_READ, &objAttrs);
 	if (!NT_SUCCESS(status)) {
 		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to open registry key\n"));
-		return status;
+		goto OnError;
 	}
+
+	ULONG uSize = 0;
+	UNICODE_STRING szValueName;
 	RtlInitUnicodeString(&szValueName, L"Target");
 	status = ZwQueryValueKey(hKey, &szValueName, KeyValuePartialInformation, NULL, 0, &uSize);
 	if (!uSize || (status != STATUS_BUFFER_TOO_SMALL && status != STATUS_BUFFER_OVERFLOW)) {
 		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to query value information for registry key\n"));
-		ZwClose(hKey);
-		return NT_SUCCESS(status) ? STATUS_BUFFER_TOO_SMALL : status;
+		status = NT_SUCCESS(status) ? STATUS_BUFFER_TOO_SMALL : status;
+		goto OnError;
 	}
+
 	pValuePartialInfo = reinterpret_cast<PKEY_VALUE_PARTIAL_INFORMATION>(ExAllocatePool2(POOL_FLAG_PAGED, uSize, 'kvpi'));
 	if (pValuePartialInfo == NULL) {
 		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to allocate memory for partial information\n"));
-		ZwClose(hKey);
-		return STATUS_NO_MEMORY;
+		status = STATUS_NO_MEMORY;
+		goto OnError;
 	}
+
+	ULONG uLenValue;
 	status = ZwQueryValueKey(hKey, &szValueName, KeyValuePartialInformation, pValuePartialInfo, uSize, &uLenValue);
 	if (!NT_SUCCESS(status)) {
-		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to query value for registry key (Maybe there is no Target key)\n"));
-		ExFreePoolWithTag(pValuePartialInfo, 'kvpi');
-		ZwClose(hKey);
-		return status;
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to query value for registry key\n"));
+		goto OnError;
 	}
+
 	if (pValuePartialInfo->Type != REG_SZ) {
 		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Target has wrong value type\n"));
-		ExFreePoolWithTag(pValuePartialInfo, 'kvpi');
-		ZwClose(hKey);
-		return STATUS_INVALID_PARAMETER;
+		status = STATUS_INVALID_PARAMETER;
+		goto OnError;
 	}
+
 	RtlStringCchCopyNW(pSzTargetProcess, pValuePartialInfo->DataLength / sizeof(WCHAR), reinterpret_cast<PWSTR>(pValuePartialInfo->Data), 1024);
 	if (!wcslen(pSzTargetProcess)) {
 		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Target is invalid\n"));
-		ExFreePoolWithTag(pValuePartialInfo, 'kvpi');
-		ZwClose(hKey);
-		return STATUS_INVALID_PARAMETER;
+		status = STATUS_INVALID_PARAMETER;
+		goto OnError;
 	}
+
+	// Libera a memória e fecha a chave do registro aqui, pois não são mais necessárias
 	ExFreePoolWithTag(pValuePartialInfo, 'kvpi');
+	pValuePartialInfo = NULL; // Evita dupla liberação no OnError
 	ZwClose(hKey);
+	hKey = NULL; // Evita duplo fechamento no OnError
+
 	status = PsSetCreateProcessNotifyRoutineEx(pProcessNotifyRoutine, FALSE);
 	if (!NT_SUCCESS(status)) {
 		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to register process notify routine: %08X\n", status));
-		return status;
+		goto OnError;
 	}
+
 	KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Successfully registered process notify routine\n"));
-	return 0;
+	return STATUS_SUCCESS;
+
+OnError:
+	// Ponto de limpeza centralizado
+	if (hKey) {
+		ZwClose(hKey);
+	}
+	if (pValuePartialInfo) {
+		ExFreePoolWithTag(pValuePartialInfo, 'kvpi');
+	}
+	// Desfaz a criação do link simbólico se ele foi criado
+	if (deviceObject) {
+		UNICODE_STRING symLinkOnError = RTL_CONSTANT_STRING(SYMLINK_NAME);
+		IoDeleteSymbolicLink(&symLinkOnError);
+		IoDeleteDevice(deviceObject);
+	}
+
+	return status;
 }
-
+// Função cbProcessCreated Modificada (Suspende todas as instâncias)
 VOID cbProcessCreated(PEPROCESS PEProcess, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateNotifyInfo) {
-        UNREFERENCED_PARAMETER(ProcessId);
-        if (CreateNotifyInfo != NULL && wcsstr(CreateNotifyInfo->CommandLine->Buffer, pSzTargetProcess) != NULL) {
-                KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Suspending %S\n", pSzTargetProcess));
-                PsSuspendProcess(PEProcess);
+	UNREFERENCED_PARAMETER(ProcessId);
+	if (CreateNotifyInfo != NULL && wcsstr(CreateNotifyInfo->CommandLine->Buffer, pSzTargetProcess) != NULL) {
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Suspending %S\n", pSzTargetProcess));
+		PsSuspendProcess(PEProcess);
 
-                ExAcquireFastMutex(&g_ProcessLock);
-                if (!g_SuspendedProcess) {
-                        ObReferenceObject(PEProcess);
-                        g_SuspendedProcess = PEProcess;
-                }
-                ExReleaseFastMutex(&g_ProcessLock);
-        }
+		ExAcquireFastMutex(&g_ProcessLock);
+
+		// Se já havia um processo suspenso, libera a referência antiga antes de armazenar a nova.
+		if (g_SuspendedProcess) {
+			ObDereferenceObject(g_SuspendedProcess);
+		}
+
+		ObReferenceObject(PEProcess);
+		g_SuspendedProcess = PEProcess; // Armazena o processo mais recente que foi suspenso.
+
+		ExReleaseFastMutex(&g_ProcessLock);
+	}
 }
 
 NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
