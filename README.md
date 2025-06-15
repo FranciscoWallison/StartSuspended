@@ -11,7 +11,10 @@ bcdedit /set testsigning on
 ```
 You need to disable Secureboot in your BIOS/VM settings to enable test signing.
 ### Create the driver
-It is necessary to build the driver once the repository was cloned. After that one can create the driver with:
+After cloning the repository open `StartSuspended.sln` in Visual Studio with the
+Windows Driver Kit installed. Build the **StartSuspended** project (preferably
+`Release|x64`). The resulting `StartSuspended.sys` can then be registered as a
+service with:
 ```shell
 sc create [serviceName] binPath= [absolute path of the build .sys file] type= kernel
 ```
@@ -33,18 +36,28 @@ The driver runs with SERVICE_DEMAND_START, which means you always need to start 
 ### Continuing the suspended process
 It is possible to continue the suspended process by using the Windows resource monitor.
 
-### Using the ResumeProcess CLI
-A small command line tool is provided to send the resume request to the driver. Build it from a Developer Command Prompt with:
+### Using the Controller CLI
+A small command line tool is provided to send resume requests to the driver. Build it from a Developer Command Prompt with:
 
 ```shell
-cl /EHsc ResumeProcess.cpp
+cl /EHsc Controller.cpp
 ```
 
-Copy the resulting `ResumeProcess.exe` to the machine running the driver and execute it with administrative privileges to resume the suspended process:
+Copy the resulting `Controller.exe` to the machine running the driver and execute it with administrative privileges to resume suspended processes:
 
 ```shell
-ResumeProcess.exe
+Controller.exe resume_all
+Controller.exe resume <pid>
 ```
+### Loading the driver with NtLoader
+An additional helper `NtLoader.exe` can load or unload the service using the undocumented
+`NtLoadDriver` API. Compile it in the same way:
+
+```shell
+cl /EHsc NtLoader.cpp
+```
+
+Running `NtLoader.exe load` will load the driver, while `NtLoader.exe unload` stops it.
 ### Debugging possible errors on driver start
 The driver logs every error using the [KdPrintEx](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-kdprintex) macro. The log messages can be viewed using [DebugView](https://learn.microsoft.com/en-us/sysinternals/downloads/debugview) with kernel capture on and verbose output enabled.
 ## How it works
