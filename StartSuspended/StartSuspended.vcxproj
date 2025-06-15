@@ -115,6 +115,7 @@
     <ClCompile Include="Core.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Shared.h" />
     <ClInclude Include="Undocumented.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
