@@ -2,6 +2,11 @@
 #include <windows.h>
 #include <winternl.h> // Necessário para UNICODE_STRING
 
+// Constante para verificar colisao de nome ao carregar o driver
+#ifndef STATUS_OBJECT_NAME_COLLISION
+#define STATUS_OBJECT_NAME_COLLISION ((NTSTATUS)0xC0000035L)
+#endif
+
 // --- Definições e Protótipos para a API Nativa ---
 
 // Protótipo da função NtLoadDriver
@@ -91,6 +96,21 @@ int wmain(int argc, wchar_t* argv[]) {
 
         std::wcout << L"Calling NtLoadDriver..." << std::endl;
         status = NtLoadDriver(&driverService);
+
+        if (status == STATUS_OBJECT_NAME_COLLISION) {
+            std::wcerr << L"Driver already loaded. Attempting to unload first..." << std::endl;
+
+            pNtUnloadDriver NtUnloadDriver = (pNtUnloadDriver)GetProcAddress(hNtdll, "NtUnloadDriver");
+            if (NtUnloadDriver) {
+                NTSTATUS unloadStatus = NtUnloadDriver(&driverService);
+                if (unloadStatus != 0) {
+                    std::wcerr << L"NtUnloadDriver failed with status: 0x" << std::hex << unloadStatus << std::endl;
+                } else {
+                    std::wcout << L"Previous instance unloaded. Loading again..." << std::endl;
+                    status = NtLoadDriver(&driverService);
+                }
+            }
+        }
 
         if (status == 0) { // STATUS_SUCCESS
             std::wcout << L"Driver loaded successfully!" << std::endl;
