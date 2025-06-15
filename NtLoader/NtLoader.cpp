@@ -9,6 +9,10 @@
 #define STATUS_OBJECT_NAME_COLLISION ((NTSTATUS)0xC0000035L)
 #endif
 
+#ifndef STATUS_IMAGE_ALREADY_LOADED
+#define STATUS_IMAGE_ALREADY_LOADED ((NTSTATUS)0xc000010E)
+#endif
+
 // --- Definições e Protótipos para a API Nativa ---
 
 // Protótipo da função NtLoadDriver

@@ -14,11 +14,11 @@ typedef struct _SUSPENDED_PROCESS_ENTRY {
     HANDLE ProcessId;
 } SUSPENDED_PROCESS_ENTRY, * PSUSPENDED_PROCESS_ENTRY;
 
-#define DEVICE_NAME       L"\\Device\\StartSuspended"
-#define SYMLINK_NAME      L"\\??\\StartSuspended"
+#define DEVICE_NAME      L"\\Device\\StartSuspended"
+#define SYMLINK_NAME     L"\\??\\StartSuspended"
 
 LIST_ENTRY g_SuspendedProcessListHead;
-FAST_MUTEX g_ListLock;
+KSPIN_LOCK g_ListLock;
 WCHAR pSzTargetProcess[1024];
 
 // --- Protótipos de Funções ---
@@ -29,12 +29,6 @@ NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 PCREATE_PROCESS_NOTIFY_ROUTINE_EX pProcessNotifyRoutine = cbProcessCreated;
 
-    IoDeleteSymbolicLink(&symLink);
-
-    if (status == STATUS_OBJECT_NAME_COLLISION) {
-        IoDeleteSymbolicLink(&symLink);
-        status = IoCreateSymbolicLink(&symLink, &deviceName);
-    }
 // --- Implementação do Driver ---
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
@@ -43,23 +37,28 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     PDEVICE_OBJECT deviceObject = nullptr;
     PKEY_VALUE_PARTIAL_INFORMATION pValuePartialInfo = NULL;
 
-    // Initialize symLink here, so it's always valid even if an error occurs before its explicit use.
-    UNICODE_STRING deviceName = RTL_CONSTANT_STRING(DEVICE_NAME);
-    UNICODE_STRING symLink = RTL_CONSTANT_STRING(SYMLINK_NAME);
-
     DriverObject->DriverUnload = Unload;
     KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Initializing driver!\n"));
 
     InitializeListHead(&g_SuspendedProcessListHead);
-    ExInitializeFastMutex(&g_ListLock);
+    KeInitializeSpinLock(&g_ListLock);
 
-    status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &deviceObject);
-    if (!NT_SUCCESS(status)) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to create device: %08X\n", status));
+    UNICODE_STRING deviceName = RTL_CONSTANT_STRING(DEVICE_NAME);
+    UNICODE_STRING symLink;
+    RtlInitUnicodeString(&symLink, SYMLINK_NAME);
+
+    status = IoCreateDevice(DriverObject, 0, &deviceName,
+        FILE_DEVICE_UNKNOWN, 0, FALSE, &deviceObject);
+    if (!NT_SUCCESS(status))
         goto OnError;
-    }
 
     status = IoCreateSymbolicLink(&symLink, &deviceName);
+    if (status == STATUS_OBJECT_NAME_COLLISION) {
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Stale symbolic link found. Deleting and retrying...\n"));
+        IoDeleteSymbolicLink(&symLink);
+        status = IoCreateSymbolicLink(&symLink, &deviceName);
+    }
+
     if (!NT_SUCCESS(status)) {
         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to create symbolic link: %08X\n", status));
         goto OnError;
@@ -73,7 +72,6 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     InitializeObjectAttributes(&objAttrs, RegistryPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     status = ZwOpenKey(&hKey, KEY_READ, &objAttrs);
     if (!NT_SUCCESS(status)) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to open registry key: %08X\n", status));
         goto OnError;
     }
 
@@ -107,7 +105,6 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 
     status = PsSetCreateProcessNotifyRoutineEx(pProcessNotifyRoutine, FALSE);
     if (!NT_SUCCESS(status)) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[StartSuspended] Failed to register process notify routine: %08X\n", status));
         goto OnError;
     }
 
@@ -118,8 +115,10 @@ OnError:
     if (hKey) { ZwClose(hKey); }
     if (pValuePartialInfo) { ExFreePoolWithTag(pValuePartialInfo, 'kvpi'); }
     if (deviceObject) {
-        // symLink is now guaranteed to be initialized here.
-        IoDeleteSymbolicLink(&symLink);
+        // A CORREÇÃO ESTÁ AQUI: Usamos uma nova variável local para a limpeza.
+        // Isso garante que o nome do link seja sempre válido, independentemente de onde o erro ocorreu.
+        UNICODE_STRING symLinkToClean = RTL_CONSTANT_STRING(SYMLINK_NAME);
+        IoDeleteSymbolicLink(&symLinkToClean);
         IoDeleteDevice(deviceObject);
     }
     return status;
@@ -130,17 +129,17 @@ VOID Unload(PDRIVER_OBJECT DriverObject) {
     KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Unloading driver.\n"));
     PsSetCreateProcessNotifyRoutineEx(pProcessNotifyRoutine, TRUE);
 
-    ExAcquireFastMutex(&g_ListLock);
+    KLOCK_QUEUE_HANDLE lockHandle;
+    KeAcquireInStackQueuedSpinLock(&g_ListLock, &lockHandle);
     while (!IsListEmpty(&g_SuspendedProcessListHead)) {
         PLIST_ENTRY pEntry = RemoveHeadList(&g_SuspendedProcessListHead);
         PSUSPENDED_PROCESS_ENTRY pSuspendedProcess = CONTAINING_RECORD(pEntry, SUSPENDED_PROCESS_ENTRY, ListEntry);
 
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Resuming PID %u on unload.\n", HandleToUlong(pSuspendedProcess->ProcessId)));
         PsResumeProcess(pSuspendedProcess->Process);
         ObDereferenceObject(pSuspendedProcess->Process);
         ExFreePool(pSuspendedProcess);
     }
-    ExReleaseFastMutex(&g_ListLock);
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
 
     UNICODE_STRING symLink = RTL_CONSTANT_STRING(SYMLINK_NAME);
     IoDeleteSymbolicLink(&symLink);
@@ -150,8 +149,8 @@ VOID Unload(PDRIVER_OBJECT DriverObject) {
 
 VOID cbProcessCreated(PEPROCESS PEProcess, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateNotifyInfo) {
     if (CreateNotifyInfo != NULL && wcsstr(CreateNotifyInfo->CommandLine->Buffer, pSzTargetProcess) != NULL) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Suspending PID: %u, Name: %S\n", HandleToUlong(ProcessId), pSzTargetProcess));
         PsSuspendProcess(PEProcess);
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[StartSuspended] Suspending PID: %u\n", HandleToUlong(ProcessId)));
 
         PSUSPENDED_PROCESS_ENTRY pNewEntry = (PSUSPENDED_PROCESS_ENTRY)ExAllocatePool2(POOL_FLAG_PAGED, sizeof(SUSPENDED_PROCESS_ENTRY), 'spe');
         if (pNewEntry) {
@@ -159,9 +158,10 @@ VOID cbProcessCreated(PEPROCESS PEProcess, HANDLE ProcessId, PPS_CREATE_NOTIFY_I
             pNewEntry->Process = PEProcess;
             pNewEntry->ProcessId = ProcessId;
 
-            ExAcquireFastMutex(&g_ListLock);
+            KLOCK_QUEUE_HANDLE lockHandle;
+            KeAcquireInStackQueuedSpinLock(&g_ListLock, &lockHandle);
             InsertTailList(&g_SuspendedProcessListHead, &pNewEntry->ListEntry);
-            ExReleaseFastMutex(&g_ListLock);
+            KeReleaseInStackQueuedSpinLock(&lockHandle);
         }
     }
 }
@@ -171,6 +171,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS status = STATUS_SUCCESS;
     ULONG_PTR info = 0;
+    KLOCK_QUEUE_HANDLE lockHandle;
 
     switch (stack->Parameters.DeviceIoControl.IoControlCode) {
     case IOCTL_STARTSUSPENDED_RESUME_BY_PID: {
@@ -182,7 +183,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         ULONG pidToResume = *(PULONG)Irp->AssociatedIrp.SystemBuffer;
         BOOLEAN found = FALSE;
 
-        ExAcquireFastMutex(&g_ListLock);
+        KeAcquireInStackQueuedSpinLock(&g_ListLock, &lockHandle);
         PLIST_ENTRY current = g_SuspendedProcessListHead.Flink;
         while (current != &g_SuspendedProcessListHead) {
             PSUSPENDED_PROCESS_ENTRY pEntry = CONTAINING_RECORD(current, SUSPENDED_PROCESS_ENTRY, ListEntry);
@@ -197,14 +198,14 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             }
             current = next;
         }
-        ExReleaseFastMutex(&g_ListLock);
+        KeReleaseInStackQueuedSpinLock(&lockHandle);
 
         if (!found) status = STATUS_NOT_FOUND;
         break;
     }
 
     case IOCTL_STARTSUSPENDED_RESUME_ALL: {
-        ExAcquireFastMutex(&g_ListLock);
+        KeAcquireInStackQueuedSpinLock(&g_ListLock, &lockHandle);
         while (!IsListEmpty(&g_SuspendedProcessListHead)) {
             PLIST_ENTRY pEntry = RemoveHeadList(&g_SuspendedProcessListHead);
             PSUSPENDED_PROCESS_ENTRY pSuspendedProcess = CONTAINING_RECORD(pEntry, SUSPENDED_PROCESS_ENTRY, ListEntry);
@@ -212,7 +213,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             ObDereferenceObject(pSuspendedProcess->Process);
             ExFreePool(pSuspendedProcess);
         }
-        ExReleaseFastMutex(&g_ListLock);
+        KeReleaseInStackQueuedSpinLock(&lockHandle);
         break;
     }
 
