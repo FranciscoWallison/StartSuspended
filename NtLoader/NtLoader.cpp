@@ -4,6 +4,11 @@
 #include <ntstatus.h>
 #include <winternl.h> // Necessário para UNICODE_STRING
 
+// Constante para verificar colisao de nome ao carregar o driver
+#ifndef STATUS_OBJECT_NAME_COLLISION
+#define STATUS_OBJECT_NAME_COLLISION ((NTSTATUS)0xC0000035L)
+#endif
+
 // --- Definições e Protótipos para a API Nativa ---
 
 // Protótipo da função NtLoadDriver
