@@ -21,7 +21,7 @@ LIST_ENTRY g_SuspendedProcessListHead;
 FAST_MUTEX g_ListLock;
 WCHAR pSzTargetProcess[1024];
 
-// --- Protótipos de Funções ---
+// --- ProtÃ³tipos de FunÃ§Ãµes ---
 
 VOID cbProcessCreated(PEPROCESS PEProcess, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateNotifyInfo);
 VOID Unload(PDRIVER_OBJECT DriverObject);
@@ -29,7 +29,13 @@ NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 PCREATE_PROCESS_NOTIFY_ROUTINE_EX pProcessNotifyRoutine = cbProcessCreated;
 
-// --- Implementação do Driver ---
+    IoDeleteSymbolicLink(&symLink);
+
+    if (status == STATUS_OBJECT_NAME_COLLISION) {
+        IoDeleteSymbolicLink(&symLink);
+        status = IoCreateSymbolicLink(&symLink, &deviceName);
+    }
+// --- ImplementaÃ§Ã£o do Driver ---
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     NTSTATUS status;

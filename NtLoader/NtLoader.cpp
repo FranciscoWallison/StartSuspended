@@ -1,5 +1,7 @@
 #include <iostream>
+#define WIN32_NO_STATUS
 #include <windows.h>
+#include <ntstatus.h>
 #include <winternl.h> // Necessário para UNICODE_STRING
 
 // --- Definições e Protótipos para a API Nativa ---
@@ -91,6 +93,15 @@ int wmain(int argc, wchar_t* argv[]) {
 
         std::wcout << L"Calling NtLoadDriver..." << std::endl;
         status = NtLoadDriver(&driverService);
+
+        if (status == STATUS_OBJECT_NAME_COLLISION || status == STATUS_IMAGE_ALREADY_LOADED) {
+            std::wcout << L"Driver already loaded. Attempting to unload and reload..." << std::endl;
+            pNtUnloadDriver NtUnloadDriver = (pNtUnloadDriver)GetProcAddress(hNtdll, "NtUnloadDriver");
+            if (NtUnloadDriver) {
+                NtUnloadDriver(&driverService);
+                status = NtLoadDriver(&driverService);
+            }
+        }
 
         if (status == 0) { // STATUS_SUCCESS
             std::wcout << L"Driver loaded successfully!" << std::endl;
